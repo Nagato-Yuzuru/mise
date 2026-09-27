@@ -118,14 +118,28 @@ pub(crate) fn lock_pin(project: &str, info: &PlatformInfo) -> Option<ForgePin> {
     )
 }
 
-/// Record the forge identity a release was accepted with in its lock entry.
-pub(crate) fn lock_record(info: &mut PlatformInfo, check: Option<&Check>) {
-    let pin = check.and_then(|check| check.pin.as_ref());
-    info.repository_id = pin.map(|pin| pin.repository_id.clone());
-    info.repository_owner_id = pin.and_then(|pin| pin.owner_id.clone());
-    info.repository_accepted_owner_ids = pin
-        .map(|pin| pin.accepted_owner_ids.clone())
-        .unwrap_or_default();
+/// Record who signed an accepted release in its lock entry: the signer
+/// (`scheme:signer`), and the forge identity it was accepted with. Without
+/// one, because explicit signer options skip the forge check or the
+/// certificate records no IDs, an entry that already named this signer keeps
+/// the IDs it recorded, so a commitment is never dropped silently; an entry
+/// for another signer loses them with the signer they came with.
+pub(crate) fn lock_record(info: &mut PlatformInfo, signer: String, check: Option<&Check>) {
+    let same_signer = info.signer.as_deref() == Some(signer.as_str());
+    info.signer = Some(signer);
+    match check.and_then(|check| check.pin.as_ref()) {
+        Some(pin) => {
+            info.repository_id = Some(pin.repository_id.clone());
+            info.repository_owner_id = pin.owner_id.clone();
+            info.repository_accepted_owner_ids = pin.accepted_owner_ids.clone();
+        }
+        None if same_signer => {}
+        None => {
+            info.repository_id = None;
+            info.repository_owner_id = None;
+            info.repository_accepted_owner_ids = Vec::new();
+        }
+    }
 }
 
 /// A signer as a lock entry records it, `scheme:identity`, split in two.
@@ -495,11 +509,9 @@ mod tests {
             let ok = verify(&expect).unwrap();
             assert_eq!(ok.check.continuity, Continuity::Same);
             assert_eq!(ok.check.pin, Some(hk_pin("github.com/jdx/hk")));
-            let mut info = PlatformInfo {
-                signer: Some(HK_SIGNER.into()),
-                ..Default::default()
-            };
-            lock_record(&mut info, Some(&ok.check));
+            let mut info = PlatformInfo::default();
+            lock_record(&mut info, HK_SIGNER.into(), Some(&ok.check));
+            assert_eq!(info.signer.as_deref(), Some(HK_SIGNER));
             assert_eq!(info.repository_id.as_deref(), Some(HK_ID));
             assert_eq!(info.repository_owner_id.as_deref(), Some(JDX_ID));
             assert!(info.repository_accepted_owner_ids.is_empty());
@@ -716,11 +728,8 @@ mod tests {
         let acme = source("acme/hk", HK_ID, "999");
         let ok = check(&expect("github.com/jdx/hk", vec![locked(pin)], None), &acme).unwrap();
         assert!(matches!(ok.continuity, Continuity::Renamed { .. }));
-        let mut info = PlatformInfo {
-            signer: Some(HK_SIGNER.into()),
-            ..Default::default()
-        };
-        lock_record(&mut info, Some(&ok));
+        let mut info = PlatformInfo::default();
+        lock_record(&mut info, HK_SIGNER.into(), Some(&ok));
         assert_eq!(info.repository_owner_id.as_deref(), Some("999"));
         assert_eq!(info.repository_accepted_owner_ids, vec![JDX_ID.to_string()]);
         let pin = lock_pin("github.com/jdx/hk", &info).unwrap();
@@ -834,7 +843,16 @@ mod tests {
             repository_accepted_owner_ids: vec!["3".into()],
             ..Default::default()
         };
-        lock_record(&mut cleared, None);
+        // Explicit signer options check no forge identity: the same signer
+        // keeps what its entry recorded...
+        lock_record(&mut cleared, HK_SIGNER.into(), None);
+        assert_eq!(cleared.repository_id.as_deref(), Some("1"));
+        assert_eq!(cleared.repository_owner_id.as_deref(), Some("2"));
+        assert_eq!(cleared.repository_accepted_owner_ids, vec!["3".to_string()]);
+        // ...and another signer does not inherit it.
+        let other = "sigstore-key:5A0A".to_string();
+        lock_record(&mut cleared, other.clone(), None);
+        assert_eq!(cleared.signer, Some(other));
         assert_eq!(cleared.repository_id, None);
         assert_eq!(cleared.repository_owner_id, None);
         assert!(cleared.repository_accepted_owner_ids.is_empty());

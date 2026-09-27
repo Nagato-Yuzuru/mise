@@ -527,7 +527,7 @@ pub async fn generate(
         if status == LockResolutionStatus::Unsupported {
             continue;
         }
-        let info = info.map_err(|error| eyre!(error))?;
+        let mut info = info.map_err(|error| eyre!(error))?;
         if let Some(entries) = previous.tools_for(&short) {
             for old in entries
                 .iter()
@@ -541,6 +541,7 @@ pub async fn generate(
                 .filter_map(|old| old.platforms.get(&platform.to_key()))
             {
                 ensure_no_downgrade(old, &info, &backend)?;
+                carry_forge_ids(old, &mut info);
             }
         }
         if let Some(error) = check_single_tool_provenance(
@@ -747,6 +748,20 @@ pub async fn populate_uv_locks(
         lockfile.set_uv_lock(&ba.short, &tv.version, &backend_name, &options, graph)?;
     }
     Ok(())
+}
+
+/// Keep the forge IDs an old Packslip entry recorded when the new one, for
+/// the same signer, recorded none: explicit signer options verify a release
+/// without the forge check, and an older certificate carries no IDs. Neither
+/// says the repository changed, so the commitment stays for the next
+/// resolution that does check it. Another signer cannot drop them:
+/// [`crate::packslip_forge::lock_entry_continues`] refuses it.
+fn carry_forge_ids(old: &PlatformInfo, new: &mut PlatformInfo) {
+    if new.signer.is_some() && new.signer == old.signer && new.repository_id.is_none() {
+        new.repository_id = old.repository_id.clone();
+        new.repository_owner_id = old.repository_owner_id.clone();
+        new.repository_accepted_owner_ids = old.repository_accepted_owner_ids.clone();
+    }
 }
 
 fn ensure_no_downgrade(old: &PlatformInfo, new: &PlatformInfo, backend: &str) -> Result<()> {
@@ -1512,6 +1527,25 @@ mod tests {
             ..transferred
         };
         assert!(ensure_no_downgrade(&old, &accepted, backend).is_ok());
+        // A resolution under explicit signer options records no IDs: the same
+        // signer keeps the old entry's, and another signer cannot drop them.
+        let unchecked = PlatformInfo {
+            repository_id: None,
+            repository_owner_id: None,
+            ..old.clone()
+        };
+        assert!(ensure_no_downgrade(&old, &unchecked, backend).is_ok());
+        let mut carried = unchecked.clone();
+        carry_forge_ids(&old, &mut carried);
+        assert_eq!(carried, old);
+        let unchecked_renamed = PlatformInfo {
+            signer: signer("new/tool"),
+            ..unchecked.clone()
+        };
+        assert!(ensure_no_downgrade(&old, &unchecked_renamed, backend).is_err());
+        let mut not_carried = unchecked_renamed.clone();
+        carry_forge_ids(&old, &mut not_carried);
+        assert_eq!(not_carried.repository_id, None);
         // Another workflow of the same repository is another signer.
         let other_workflow = PlatformInfo {
             signer: Some(
