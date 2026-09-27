@@ -13,6 +13,7 @@ use eyre::{Report, eyre};
 use packslip::forge::{
     self, Check, Continuity, Expected, ForgePin, IdentityError, PinSource, Transfer,
 };
+use packslip::sigstore::SourceRepository;
 use packslip::{ForgeError, ForgeVerified, Options, Verified, VerifiedList};
 
 use crate::config::{Settings, SettingsExt};
@@ -218,7 +219,7 @@ impl ForgeExpect {
         artifacts: &[&Path],
     ) -> eyre::Result<ForgeVerified<Verified>> {
         packslip::verify_forge(bundle, &self.expected(), options, artifacts)
-            .map_err(|err| self.error(err))
+            .map_err(|err| self.error(err, bundle))
     }
 
     /// Verify a release list under the forge's policy and check who signed it.
@@ -228,17 +229,59 @@ impl ForgeExpect {
         options: Options<'_>,
     ) -> eyre::Result<ForgeVerified<VerifiedList>> {
         packslip::verify_forge_release_list(bundle, &self.expected(), options)
-            .map_err(|err| self.error(err))
+            .map_err(|err| self.error(err, bundle))
     }
 
-    fn error(&self, err: ForgeError) -> Report {
+    fn error(&self, err: ForgeError, bundle: &str) -> Report {
         match err {
-            ForgeError::Identity(err) => self.identity_error(err),
+            // The signature verified, or the check would not have run, so the
+            // certificate's repository is the release's: it is read again only
+            // to tell which pins a recovery has to clear.
+            ForgeError::Identity(err) => {
+                let source = packslip::sigstore::source_repository(bundle).ok().flatten();
+                self.identity_error(err, source.as_ref())
+            }
             err => eyre!("{err}"),
         }
     }
 
-    fn identity_error(&self, err: IdentityError) -> Report {
+    /// Which of the project's pins a release signed as `signed`, whose
+    /// certificate records `source`, disagrees with: this machine's, and the
+    /// lockfile's. The check stops at the first pin that fails, but a
+    /// recovery has to clear every one, or the next install is refused by
+    /// the next. Without the certificate's IDs, every pin counts.
+    fn disagreeing(
+        &self,
+        signed: &str,
+        source: Option<&SourceRepository>,
+        cited: Option<PinSource>,
+    ) -> Disagreeing {
+        let release = source.and_then(|source| {
+            Some(ForgePin::new(
+                signed,
+                source.id.clone()?,
+                source.owner_id.clone(),
+            ))
+        });
+        let disagrees = |pin: &ForgePin| {
+            release
+                .as_ref()
+                .is_none_or(|release| !release.continues(pin))
+        };
+        let from = |want: PinSource| {
+            cited == Some(want)
+                || self
+                    .pins
+                    .iter()
+                    .any(|(source, pin)| *source == want && disagrees(pin))
+        };
+        Disagreeing {
+            local: from(PinSource::Local),
+            lockfile: from(PinSource::Lockfile),
+        }
+    }
+
+    fn identity_error(&self, err: IdentityError, source: Option<&SourceRepository>) -> Report {
         let requested = &self.project;
         match err {
             IdentityError::DifferentRepository {
@@ -249,37 +292,50 @@ impl ForgeExpect {
             } => {
                 let kind = id_kind(requested);
                 let refused = "The name now belongs to a different repository, as it would if the original was deleted and someone else created one under its name, so mise refuses it.";
-                match evidence.pin_source() {
-                    Some(PinSource::Lockfile) => eyre!(
-                        "packslip:{requested}: this release was signed by {project} as {kind} {actual}, but mise.lock pins {kind} {expected} for it. {refused}\n\n\
-                         If the vendor re-created the repository itself, remove the tool's entries from mise.lock and install again."
-                    ),
-                    Some(_) => {
-                        // Forgetting this machine's pin is not enough when the
-                        // lockfile commits to the same repository.
-                        let locked = self.pins.iter().any(|(source, pin)| {
-                            *source == PinSource::Lockfile && pin.repository_id == expected
-                        });
-                        let steps = if locked {
-                            format!(
-                                "run `mise packslip forget {requested}`, remove the tool's entries from mise.lock, and install again"
-                            )
-                        } else {
-                            format!("run `mise packslip forget {requested}` and install again")
-                        };
-                        eyre!(
-                            "packslip:{requested}: this release was signed by {project} as {kind} {actual}, but mise pinned {kind} {expected} for it. {refused}\n\n\
-                             If the vendor re-created the repository itself, {steps}."
-                        )
-                    }
-                    None => eyre!(
+                let Some(cited) = evidence.pin_source() else {
+                    return eyre!(
                         "packslip:{requested}: this release was signed by {project} as {kind} {actual}, but {requested} is {kind} {expected} now. \
                          The release comes from a different repository than the one the name belongs to, so mise refuses it."
-                    ),
-                }
+                    );
+                };
+                let pinned = match cited {
+                    PinSource::Lockfile => "mise.lock pins",
+                    _ => "mise pinned",
+                };
+                let steps = self
+                    .disagreeing(&project, source, Some(cited))
+                    .steps(requested);
+                eyre!(
+                    "packslip:{requested}: this release was signed by {project} as {kind} {actual}, but {pinned} {kind} {expected} for it. {refused}\n\n\
+                     If the vendor re-created the repository itself, {steps}."
+                )
             }
-            IdentityError::OwnerChanged(transfer) => transfer_error(requested, &transfer),
+            IdentityError::OwnerChanged(transfer) => {
+                let cited = transfer.evidence.and_then(|evidence| evidence.pin_source());
+                let disagreeing = self.disagreeing(&transfer.signed, source, cited);
+                transfer_error(requested, &transfer, disagreeing)
+            }
             err => eyre!("{err}"),
+        }
+    }
+}
+
+/// The pins a refused release disagrees with, by where they came from.
+#[derive(Debug, Clone, Copy)]
+struct Disagreeing {
+    local: bool,
+    lockfile: bool,
+}
+
+impl Disagreeing {
+    /// Every step that clears them, for the project as `requested` names it.
+    fn steps(self, requested: &str) -> String {
+        let forget = format!("run `mise packslip forget {requested}`");
+        let unlock = "remove the tool's entries from mise.lock";
+        match (self.local, self.lockfile) {
+            (true, true) => format!("{forget}, {unlock}, and install again"),
+            (true, false) => format!("{forget} and install again"),
+            (false, _) => format!("{unlock} and install again"),
         }
     }
 }
@@ -293,7 +349,7 @@ fn id_kind(project: &str) -> &'static str {
     }
 }
 
-fn transfer_error(requested: &str, transfer: &Transfer) -> Report {
+fn transfer_error(requested: &str, transfer: &Transfer, disagreeing: Disagreeing) -> Report {
     let owner = |name: &str, id: Option<&str>| match id {
         Some(id) => format!("{name} (ID {id})"),
         None => name.to_string(),
@@ -309,10 +365,19 @@ fn transfer_error(requested: &str, transfer: &Transfer) -> Report {
         Some(_) => format!("mise pinned owner {before}"),
         None => format!("{requested} has owner {before}"),
     };
+    let accept = if signed == requested {
+        disagreeing.steps(requested)
+    } else if disagreeing.local {
+        // This machine's pin is found by the repository's ID under the new
+        // name too; the lockfile's entries are the old name's.
+        format!("change the tool to packslip:{signed}, and run `mise packslip forget {requested}`")
+    } else {
+        format!("change the tool to packslip:{signed}")
+    };
     eyre!(
         "packslip:{requested}: this release was signed by {signed}, the same repository under another owner: owner {now} signed it, but {expected}. \
          mise follows a repository that was renamed, but not one that changed hands, since trusting the old owner says nothing about the new one.\n\n\
-         If {signed} is where the repository lives now and you trust its owner, change the tool to packslip:{signed}."
+         If {signed} is where the repository lives now and you trust its owner, {accept}."
     )
 }
 
@@ -338,7 +403,7 @@ pub(crate) async fn warn_if_renamed(check: &Check) {
 
 #[cfg(test)]
 mod tests {
-    use packslip::sigstore::{GITHUB_ISSUER, SourceRepository};
+    use packslip::sigstore::GITHUB_ISSUER;
 
     use super::*;
 
@@ -384,7 +449,7 @@ mod tests {
             Some(GITHUB_ISSUER),
             Some(source),
         )
-        .map_err(|err| expect.identity_error(err))
+        .map_err(|err| expect.identity_error(err, Some(source)))
     }
 
     fn expect(
@@ -525,6 +590,50 @@ mod tests {
         );
         assert!(!msg.contains("mise packslip forget"), "{msg}");
 
+        // This machine's pin fails first, but the lockfile's pins yet another
+        // repository: the advice clears both, not only the one cited.
+        let err = check(
+            &expect(
+                "github.com/jdx/hk",
+                vec![
+                    local(other.clone()),
+                    locked(ForgePin::new("github.com/jdx/hk", "2", Some(JDX_ID.into()))),
+                ],
+                None,
+            ),
+            &hk(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mise pinned GitHub repository ID 1 for it"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(
+                "run `mise packslip forget github.com/jdx/hk`, remove the tool's entries from mise.lock, and install again"
+            ),
+            "{msg}"
+        );
+        // And the other way round.
+        let err = check(
+            &expect(
+                "github.com/jdx/hk",
+                vec![
+                    local(ForgePin::new("github.com/jdx/hk", "2", Some(JDX_ID.into()))),
+                    locked(other.clone()),
+                ],
+                None,
+            ),
+            &hk(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "run `mise packslip forget github.com/jdx/hk`, remove the tool's entries from mise.lock, and install again"
+            ),
+            "{err}"
+        );
         // Both commit to it: forgetting the pin alone would not do.
         let err = check(
             &expect(
@@ -566,7 +675,7 @@ mod tests {
             "{msg}"
         );
         assert!(
-            msg.contains("change the tool to packslip:github.com/jdx/hk"),
+            msg.contains("change the tool to packslip:github.com/jdx/hk."),
             "{msg}"
         );
         let moved = ForgePin::new("github.com/acme/hk", HK_ID, Some("999".into()));
@@ -588,6 +697,13 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("but mise pinned owner acme (ID 999)"),
+            "{err}"
+        );
+        // This machine's pin would hold the new name to the old owner too.
+        assert!(
+            err.to_string().contains(
+                "change the tool to packslip:github.com/jdx/hk, and run `mise packslip forget github.com/acme/hk`"
+            ),
             "{err}"
         );
     }
@@ -774,5 +890,181 @@ mod tests {
     fn the_claimed_project_is_read_before_verification() {
         assert_eq!(claimed_project(HK).as_deref(), Some("github.com/jdx/hk"));
         assert_eq!(claimed_project("not a bundle"), None);
+    }
+
+    /// What the hk release showed, with `check` the forge check it passed.
+    fn hk_observed(check: Option<&Check>, provenance: bool) -> packslip_pins::Observed<'_> {
+        packslip_pins::Observed {
+            scheme: "sigstore-oidc",
+            key_id: "https://github.com/jdx/hk/.github/workflows/release.yml@refs/tags/v2.3.0",
+            issuer: Some("https://token.actions.githubusercontent.com"),
+            attested_by: "vendor",
+            provenance,
+            logged: true,
+            forge: check,
+        }
+    }
+
+    /// A pins file with one pin for jdx/hk's repository under `key`, as a
+    /// machine that installed it before a rename to jdx/hk wrote it, and a
+    /// release-list sequence under the same name.
+    fn pins_under(
+        key: &str,
+        workflow: &str,
+        owner_id: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.toml");
+        crate::file::write(
+            &path,
+            format!(
+                r#"[pins."{key}"]
+scheme = "sigstore-oidc"
+signer = "https://{key}/.github/workflows/{workflow}"
+issuer = "https://token.actions.githubusercontent.com"
+attested_by = "vendor"
+provenance = true
+unlogged = false
+pinned_at = "2026-09-01T00:00:00Z"
+
+[pins."{key}".forge]
+project = "{key}"
+repository_id = "922514152"
+owner_id = "{owner_id}"
+
+[sequences]
+"{key}" = 7
+"#
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn a_config_that_follows_a_rename_first_keeps_the_pin() {
+        // The config (or another machine's) says jdx/hk while this machine
+        // pinned the repository as jdx/old-hk, before any release signed
+        // under the new name was accepted. The release's repository ID finds
+        // the pin: it is not a first install.
+        let (_dir, path) = pins_under("github.com/jdx/old-hk", "release.yml", JDX_ID);
+        let check = verify(&expect("github.com/jdx/hk", vec![], None))
+            .unwrap()
+            .check;
+        assert_eq!(check.continuity, Continuity::Same);
+        let err =
+            packslip_pins::check_at(&path, "github.com/jdx/hk", hk_observed(Some(&check), false))
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("drops the build provenance"), "{msg}");
+        assert!(
+            msg.contains("mise pinned the repository as packslip:github.com/jdx/old-hk"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("mise packslip forget github.com/jdx/old-hk"),
+            "{msg}"
+        );
+        assert!(
+            packslip_pins::record_at(&path, "github.com/jdx/hk", hk_observed(Some(&check), false))
+                .is_err()
+        );
+
+        // What the pin requires, it accepts, and the pin moves to the new
+        // name with everything it had: one pin for the repository.
+        let pin =
+            packslip_pins::record_at(&path, "github.com/jdx/hk", hk_observed(Some(&check), true))
+                .unwrap();
+        let pins = packslip_pins::list_at(&path).unwrap();
+        assert_eq!(
+            pins.keys().collect::<Vec<_>>(),
+            ["github.com/jdx/hk"],
+            "no duplicate pin"
+        );
+        assert_eq!(pins["github.com/jdx/hk"], pin);
+        assert_eq!(pin.pinned_at, "2026-09-01T00:00:00Z");
+        assert!(pin.provenance);
+        assert_eq!(pin.forge, Some(hk_pin("github.com/jdx/hk")));
+        // Its release-list sequence came along.
+        let err =
+            packslip_pins::check_sequence_at(&path, "github.com/jdx/hk", 6, None).unwrap_err();
+        assert!(
+            err.to_string().contains("sequence 7 was already accepted"),
+            "{err}"
+        );
+        assert!(packslip_pins::check_missing_list_at(&path, "github.com/jdx/hk", None).is_err());
+        // And the name the pin had is still held to it.
+        assert!(
+            packslip_pins::check_at(
+                &path,
+                "github.com/jdx/old-hk",
+                hk_observed(Some(&check), false),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_pin_found_by_repository_id_still_refuses_another_signer() {
+        let (_dir, path) = pins_under("github.com/jdx/old-hk", "other.yml", JDX_ID);
+        let check = verify(&expect("github.com/jdx/hk", vec![], None))
+            .unwrap()
+            .check;
+        let err =
+            packslip_pins::record_at(&path, "github.com/jdx/hk", hk_observed(Some(&check), true))
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("signed what mise accepted before"),
+            "{err}"
+        );
+        let pins = packslip_pins::list_at(&path).unwrap();
+        assert_eq!(
+            pins.keys().collect::<Vec<_>>(),
+            ["github.com/jdx/old-hk"],
+            "a refusal moves nothing"
+        );
+    }
+
+    #[test]
+    fn a_pin_found_by_repository_id_still_refuses_a_transfer() {
+        // The pin recorded the repository under owner 999; the release is
+        // signed by it under jdx (216188).
+        let (_dir, path) = pins_under("github.com/acme/hk", "release.yml", "999");
+        let check = verify(&expect("github.com/jdx/hk", vec![], None))
+            .unwrap()
+            .check;
+        let err =
+            packslip_pins::check_at(&path, "github.com/jdx/hk", hk_observed(Some(&check), true))
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "the repository mise pinned as packslip:github.com/acme/hk, but under another owner"
+            ),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("mise packslip forget github.com/acme/hk"),
+            "{msg}"
+        );
+        assert!(
+            packslip_pins::record_at(&path, "github.com/jdx/hk", hk_observed(Some(&check), true))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn another_tool_of_the_same_repository_keeps_its_own_pin() {
+        let (_dir, path) = pins_under("github.com/jdx/hk/other", "other.yml", JDX_ID);
+        let check = verify(&expect("github.com/jdx/hk", vec![], None))
+            .unwrap()
+            .check;
+        packslip_pins::record_at(&path, "github.com/jdx/hk", hk_observed(Some(&check), false))
+            .unwrap();
+        let pins = packslip_pins::list_at(&path).unwrap();
+        assert_eq!(
+            pins.keys().collect::<Vec<_>>(),
+            ["github.com/jdx/hk", "github.com/jdx/hk/other"]
+        );
     }
 }
