@@ -237,9 +237,11 @@ Two changes are refused instead:
   new one. After confirming the transfer, name the repository as it is called
   now, such as `packslip:github.com/new-owner/tool`.
 - **A different repository under the same name**, which is what a deleted
-  repository whose name someone else took looks like. The error says so; if the
-  vendor re-created the repository itself, run `mise packslip forget` for the
-  project and remove its `mise.lock` entries.
+  repository whose name someone else took looks like. The error says whether
+  this machine's pin or `mise.lock` recorded the original; if the vendor
+  re-created the repository itself, reset that record: run
+  `mise packslip forget` for the project, remove its `mise.lock` entries, or
+  both, as the error says.
 
 A machine with no pin and no lockfile entry trusts whichever repository has the
 name at its first install. See

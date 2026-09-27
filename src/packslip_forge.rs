@@ -10,7 +10,9 @@
 use std::path::Path;
 
 use eyre::{Report, eyre};
-use packslip::forge::{Check, Continuity, Evidence, Expected, ForgePin, IdentityError};
+use packslip::forge::{
+    self, Check, Continuity, Expected, ForgePin, IdentityError, PinSource, Transfer,
+};
 use packslip::{ForgeError, ForgeVerified, Options, Verified, VerifiedList};
 
 use crate::config::{Settings, SettingsExt};
@@ -24,17 +26,34 @@ use crate::{github, gitlab, packslip_pins};
 pub(crate) struct ForgeExpect {
     project: String,
     /// This machine's pin first, then the lockfile's. Each one must hold.
-    pins: Vec<ForgePin>,
+    pins: Vec<(PinSource, ForgePin)>,
     resolved: Option<String>,
+    /// The ID of the requested project's owner, when the forge's answer for
+    /// the name is under that owner.
+    resolved_owner: Option<String>,
 }
 
 /// What the forge says a project name stands for now.
 #[derive(Debug, Clone)]
 struct ForgeRepository {
     id: String,
+    /// The ID of the owner the project was requested under, when the forge
+    /// answered under that owner's name. An answer under another owner is a
+    /// redirect after a transfer, and says nothing about who owns the
+    /// requested name.
+    owner_id: Option<String>,
     /// The project as it is called now, `github.com/owner/repo[/tool]` or
     /// `gitlab.com/<path>`.
     project: String,
+}
+
+/// Whether `current`, a repository path the forge gave (`owner/repo`, or a
+/// GitLab `group/sub/project`), is under the owner or namespace `owner`.
+/// Owner names are case-insensitive on both forges.
+fn under_owner(owner: &str, current: &str) -> bool {
+    current
+        .rsplit_once('/')
+        .is_some_and(|(namespace, _)| namespace.eq_ignore_ascii_case(owner))
 }
 
 /// The repository ID and name the forge gives `project` now, following a
@@ -51,8 +70,11 @@ async fn lookup(project: &str) -> Option<ForgeRepository> {
             .unwrap_or_default();
         return match github::repository_identity(&format!("{owner}/{repo}")).await {
             Ok(found) => Some(ForgeRepository {
-                id: found.id,
+                owner_id: found
+                    .owner_id
+                    .filter(|_| under_owner(owner, &found.full_name)),
                 project: format!("{host}/{}{subpath}", found.full_name),
+                id: found.id,
             }),
             Err(err) => {
                 debug!("packslip:{project}: could not look up its repository ID: {err:#}");
@@ -61,10 +83,14 @@ async fn lookup(project: &str) -> Option<ForgeRepository> {
         };
     }
     let path = project.strip_prefix("gitlab.com/")?;
+    let namespace = path.rsplit_once('/').map_or("", |(namespace, _)| namespace);
     match gitlab::project_identity(path).await {
         Ok(found) => Some(ForgeRepository {
-            id: found.id,
+            owner_id: found
+                .namespace_id
+                .filter(|_| under_owner(namespace, &found.path_with_namespace)),
             project: format!("gitlab.com/{}", found.path_with_namespace),
+            id: found.id,
         }),
         Err(err) => {
             debug!("packslip:{project}: could not look up its project ID: {err:#}");
@@ -74,19 +100,21 @@ async fn lookup(project: &str) -> Option<ForgeRepository> {
 }
 
 /// The project a bundle's statement claims, before anything is verified.
+/// Only fit to decide whether a forge lookup is worth making.
 fn claimed_project(bundle: &str) -> Option<String> {
-    let payload = packslip::sigstore::peek_statement(bundle).ok()?;
-    let statement: serde_json::Value = serde_json::from_slice(&payload).ok()?;
-    statement["predicate"]["project"]
-        .as_str()
-        .map(str::to_string)
+    packslip::peek_unverified(bundle)
+        .ok()
+        .map(|claimed| claimed.project)
 }
 
 /// The forge identity a lock entry committed to, if it recorded one.
 pub(crate) fn lock_pin(project: &str, info: &PlatformInfo) -> Option<ForgePin> {
     info.signer.as_ref()?;
     let id = info.repository_id.clone()?;
-    Some(ForgePin::new(project, id, info.repository_owner_id.clone()))
+    Some(
+        ForgePin::new(project, id, info.repository_owner_id.clone())
+            .with_accepted_owner_ids(info.repository_accepted_owner_ids.clone()),
+    )
 }
 
 /// Record the forge identity a release was accepted with in its lock entry.
@@ -94,6 +122,14 @@ pub(crate) fn lock_record(info: &mut PlatformInfo, check: Option<&Check>) {
     let pin = check.and_then(|check| check.pin.as_ref());
     info.repository_id = pin.map(|pin| pin.repository_id.clone());
     info.repository_owner_id = pin.and_then(|pin| pin.owner_id.clone());
+    info.repository_accepted_owner_ids = pin
+        .map(|pin| pin.accepted_owner_ids.clone())
+        .unwrap_or_default();
+}
+
+/// A signer as a lock entry records it, `scheme:identity`, split in two.
+fn split_signer(signer: &str) -> (&str, &str) {
+    signer.split_once(':').unwrap_or(("", signer))
 }
 
 /// Whether a signer a lock entry recorded (`scheme:signer`) is the one that
@@ -103,12 +139,28 @@ pub(crate) fn lock_signer_continues(locked: &str, signer: &str, check: Option<&C
     if locked == signer {
         return true;
     }
-    let (Some((locked_scheme, locked_signer)), Some((scheme, _))) =
-        (locked.split_once(':'), signer.split_once(':'))
-    else {
-        return false;
+    let ((locked_scheme, locked_identity), (scheme, _)) =
+        (split_signer(locked), split_signer(signer));
+    locked_scheme == scheme && check.is_some_and(|check| check.continues_signer(locked_identity))
+}
+
+/// Whether a newly resolved lock entry for `project` is signed by the signer
+/// the old one committed to: the same scheme, and the same signer given the
+/// forge identity each entry recorded. A rename keeps the signer; a
+/// repository ID that changed, or an owner neither entry accepted, does not.
+pub(crate) fn lock_entry_continues(project: &str, old: &PlatformInfo, new: &PlatformInfo) -> bool {
+    let (Some(previous), Some(current)) = (&old.signer, &new.signer) else {
+        return old.signer.is_none();
     };
-    locked_scheme == scheme && check.is_some_and(|check| check.continues_signer(locked_signer))
+    let ((previous_scheme, previous), (scheme, current)) =
+        (split_signer(previous), split_signer(current));
+    previous_scheme == scheme
+        && forge::same_workflow(
+            previous,
+            lock_pin(project, old).as_ref(),
+            current,
+            lock_pin(project, new).as_ref(),
+        )
 }
 
 impl ForgeExpect {
@@ -126,51 +178,36 @@ impl ForgeExpect {
     ) -> eyre::Result<Self> {
         let mut pins = Vec::new();
         if let Some(pin) = packslip_pins::forge_pin(project)? {
-            pins.push(pin);
+            pins.push((PinSource::Local, pin));
         }
         for pin in lock.into_iter().filter_map(|info| lock_pin(project, info)) {
+            let pin = (PinSource::Lockfile, pin);
             if !pins.contains(&pin) {
                 pins.push(pin);
             }
         }
-        let resolved = if pins.is_empty() && claimed_project(bundle).as_deref() != Some(project) {
-            lookup(project).await.map(|found| found.id)
+        let found = if pins.is_empty() && claimed_project(bundle).as_deref() != Some(project) {
+            lookup(project).await
         } else {
             None
+        };
+        let (resolved, resolved_owner) = match found {
+            Some(found) => (Some(found.id), found.owner_id),
+            None => (None, None),
         };
         Ok(Self {
             project: project.to_string(),
             pins,
             resolved,
+            resolved_owner,
         })
     }
 
     fn expected(&self) -> Expected<'_> {
         Expected::new(&self.project)
-            .pinned(self.pins.first())
+            .pinned_by(&self.pins)
             .resolved(self.resolved.as_deref())
-    }
-
-    /// Hold the release to every pin after the first, which the crate
-    /// already checked.
-    fn check_other_pins(
-        &self,
-        signed_project: &str,
-        identity: &str,
-        issuer: Option<&str>,
-        check: &Check,
-    ) -> eyre::Result<()> {
-        for pin in self.pins.iter().skip(1) {
-            packslip::forge::check(
-                &Expected::new(&self.project).pinned(Some(pin)),
-                signed_project,
-                identity,
-                issuer,
-                check.source.as_ref(),
-            )
-            .map_err(|err| self.identity_error(err))?;
-        }
-        Ok(())
+            .resolved_owner(self.resolved_owner.as_deref())
     }
 
     /// Verify a bundle under the forge's policy and check who signed it.
@@ -180,15 +217,8 @@ impl ForgeExpect {
         options: Options<'_>,
         artifacts: &[&Path],
     ) -> eyre::Result<ForgeVerified<Verified>> {
-        let verified = packslip::verify_forge(bundle, &self.expected(), options, artifacts)
-            .map_err(|err| self.error(err))?;
-        self.check_other_pins(
-            &verified.verified.project,
-            &verified.verified.key_id,
-            verified.verified.issuer.as_deref(),
-            &verified.check,
-        )?;
-        Ok(verified)
+        packslip::verify_forge(bundle, &self.expected(), options, artifacts)
+            .map_err(|err| self.error(err))
     }
 
     /// Verify a release list under the forge's policy and check who signed it.
@@ -197,15 +227,8 @@ impl ForgeExpect {
         bundle: &str,
         options: Options<'_>,
     ) -> eyre::Result<ForgeVerified<VerifiedList>> {
-        let verified = packslip::verify_forge_release_list(bundle, &self.expected(), options)
-            .map_err(|err| self.error(err))?;
-        self.check_other_pins(
-            &verified.verified.list.predicate.project,
-            &verified.verified.key_id,
-            verified.verified.issuer.as_deref(),
-            &verified.check,
-        )?;
-        Ok(verified)
+        packslip::verify_forge_release_list(bundle, &self.expected(), options)
+            .map_err(|err| self.error(err))
     }
 
     fn error(&self, err: ForgeError) -> Report {
@@ -216,7 +239,48 @@ impl ForgeExpect {
     }
 
     fn identity_error(&self, err: IdentityError) -> Report {
-        identity_error(&self.project, err)
+        let requested = &self.project;
+        match err {
+            IdentityError::DifferentRepository {
+                project,
+                expected,
+                actual,
+                evidence,
+            } => {
+                let kind = id_kind(requested);
+                let refused = "The name now belongs to a different repository, as it would if the original was deleted and someone else created one under its name, so mise refuses it.";
+                match evidence.pin_source() {
+                    Some(PinSource::Lockfile) => eyre!(
+                        "packslip:{requested}: this release was signed by {project} as {kind} {actual}, but mise.lock pins {kind} {expected} for it. {refused}\n\n\
+                         If the vendor re-created the repository itself, remove the tool's entries from mise.lock and install again."
+                    ),
+                    Some(_) => {
+                        // Forgetting this machine's pin is not enough when the
+                        // lockfile commits to the same repository.
+                        let locked = self.pins.iter().any(|(source, pin)| {
+                            *source == PinSource::Lockfile && pin.repository_id == expected
+                        });
+                        let steps = if locked {
+                            format!(
+                                "run `mise packslip forget {requested}`, remove the tool's entries from mise.lock, and install again"
+                            )
+                        } else {
+                            format!("run `mise packslip forget {requested}` and install again")
+                        };
+                        eyre!(
+                            "packslip:{requested}: this release was signed by {project} as {kind} {actual}, but mise pinned {kind} {expected} for it. {refused}\n\n\
+                             If the vendor re-created the repository itself, {steps}."
+                        )
+                    }
+                    None => eyre!(
+                        "packslip:{requested}: this release was signed by {project} as {kind} {actual}, but {requested} is {kind} {expected} now. \
+                         The release comes from a different repository than the one the name belongs to, so mise refuses it."
+                    ),
+                }
+            }
+            IdentityError::OwnerChanged(transfer) => transfer_error(requested, &transfer),
+            err => eyre!("{err}"),
+        }
     }
 }
 
@@ -229,36 +293,27 @@ fn id_kind(project: &str) -> &'static str {
     }
 }
 
-fn identity_error(requested: &str, err: IdentityError) -> Report {
-    match err {
-        IdentityError::DifferentRepository {
-            project,
-            expected,
-            actual,
-            evidence,
-        } => {
-            let kind = id_kind(requested);
-            match evidence {
-                Evidence::Pin => eyre!(
-                    "packslip:{requested}: this release was signed by {project} as {kind} {actual}, but mise pinned {kind} {expected} for it. \
-                     The name now belongs to a different repository, as it would if the original was deleted and someone else created one under its name, so mise refuses it.\n\n\
-                     If the vendor re-created the repository itself, run `mise packslip forget {requested}`, remove the tool's entries from mise.lock, and install again."
-                ),
-                _ => eyre!(
-                    "packslip:{requested}: this release was signed by {project} as {kind} {actual}, but {requested} is {kind} {expected} now. \
-                     The release comes from a different repository than the one the name belongs to, so mise refuses it."
-                ),
-            }
-        }
-        IdentityError::Transferred {
-            requested, signed, ..
-        } => eyre!(
-            "packslip:{requested}: this release was signed by {signed}, the same repository under another owner. \
-             mise follows a repository that was renamed, but not one that changed hands, since trusting the old owner says nothing about the new one.\n\n\
-             If {signed} is where the repository lives now and you trust its owner, change the tool to packslip:{signed}."
-        ),
-        err => eyre!("{err}"),
-    }
+fn transfer_error(requested: &str, transfer: &Transfer) -> Report {
+    let owner = |name: &str, id: Option<&str>| match id {
+        Some(id) => format!("{name} (ID {id})"),
+        None => name.to_string(),
+    };
+    let signed = &transfer.signed;
+    let now = owner(&transfer.owner, transfer.owner_id.as_deref());
+    let before = owner(
+        &transfer.previous_owner,
+        transfer.previous_owner_id.as_deref(),
+    );
+    let expected = match transfer.evidence.and_then(|evidence| evidence.pin_source()) {
+        Some(PinSource::Lockfile) => format!("mise.lock pins owner {before}"),
+        Some(_) => format!("mise pinned owner {before}"),
+        None => format!("{requested} has owner {before}"),
+    };
+    eyre!(
+        "packslip:{requested}: this release was signed by {signed}, the same repository under another owner: owner {now} signed it, but {expected}. \
+         mise follows a repository that was renamed, but not one that changed hands, since trusting the old owner says nothing about the new one.\n\n\
+         If {signed} is where the repository lives now and you trust its owner, change the tool to packslip:{signed}."
+    )
 }
 
 /// Say, once, that a project was installed under a name it no longer has.
@@ -283,13 +338,18 @@ pub(crate) async fn warn_if_renamed(check: &Check) {
 
 #[cfg(test)]
 mod tests {
+    use packslip::sigstore::{GITHUB_ISSUER, SourceRepository};
+
     use super::*;
 
     /// jdx/hk's v2.3.0 packslip as its release workflow published it. Its
     /// certificate records repository ID 922514152 and owner ID 216188.
     const HK: &str = include_str!("../test/fixtures/packslip-forge/hk-v2.3.0.sigstore.json");
     const HK_SIGNER: &str = "sigstore-oidc:https://github.com/jdx/hk/.github/workflows/release.yml";
+    const HK_ID: &str = "922514152";
+    const JDX_ID: &str = "216188";
 
+    /// Verify the hk bundle in full, certificate and all.
     fn verify(expect: &ForgeExpect) -> eyre::Result<ForgeVerified<Verified>> {
         let root = packslip::sigstore::trusted_root(None).unwrap();
         let options = Options {
@@ -299,23 +359,73 @@ mod tests {
         expect.verify(HK, options, &[])
     }
 
-    fn expect(project: &str, pins: Vec<ForgePin>, resolved: Option<&str>) -> ForgeExpect {
+    /// What a certificate for `owner/repo`, of repository `id` and owner
+    /// `owner_id`, records.
+    fn source(repo: &str, id: &str, owner_id: &str) -> SourceRepository {
+        let (owner, _) = repo.split_once('/').unwrap();
+        SourceRepository::new(format!("https://github.com/{repo}"))
+            .with_id(id)
+            .with_owner(format!("https://github.com/{owner}"), owner_id)
+    }
+
+    fn hk() -> SourceRepository {
+        source("jdx/hk", HK_ID, JDX_ID)
+    }
+
+    /// Check a release that `source`'s release workflow signed, as
+    /// [`ForgeExpect::verify`] does once the bundle itself verified.
+    fn check(expect: &ForgeExpect, source: &SourceRepository) -> eyre::Result<Check> {
+        let signed = source.uri.strip_prefix("https://").unwrap();
+        let identity = format!("{}/.github/workflows/release.yml@refs/tags/v1", source.uri);
+        forge::check(
+            &expect.expected(),
+            signed,
+            &identity,
+            Some(GITHUB_ISSUER),
+            Some(source),
+        )
+        .map_err(|err| expect.identity_error(err))
+    }
+
+    fn expect(
+        project: &str,
+        pins: Vec<(PinSource, ForgePin)>,
+        resolved: Option<&str>,
+    ) -> ForgeExpect {
         ForgeExpect {
             project: project.into(),
             pins,
             resolved: resolved.map(str::to_string),
+            resolved_owner: None,
         }
     }
 
     fn hk_pin(project: &str) -> ForgePin {
-        ForgePin::new(project, "922514152", Some("216188".into()))
+        ForgePin::new(project, HK_ID, Some(JDX_ID.into()))
+    }
+
+    fn local(pin: ForgePin) -> (PinSource, ForgePin) {
+        (PinSource::Local, pin)
+    }
+
+    fn locked(pin: ForgePin) -> (PinSource, ForgePin) {
+        (PinSource::Lockfile, pin)
     }
 
     #[test]
     fn the_same_repository_under_its_own_name_is_accepted() {
         for expect in [
             expect("github.com/jdx/hk", vec![], None),
-            expect("github.com/jdx/hk", vec![hk_pin("github.com/jdx/hk")], None),
+            expect(
+                "github.com/jdx/hk",
+                vec![local(hk_pin("github.com/jdx/hk"))],
+                None,
+            ),
+            expect(
+                "github.com/jdx/hk",
+                vec![locked(hk_pin("github.com/jdx/hk"))],
+                None,
+            ),
         ] {
             let ok = verify(&expect).unwrap();
             assert_eq!(ok.check.continuity, Continuity::Same);
@@ -325,8 +435,9 @@ mod tests {
                 ..Default::default()
             };
             lock_record(&mut info, Some(&ok.check));
-            assert_eq!(info.repository_id.as_deref(), Some("922514152"));
-            assert_eq!(info.repository_owner_id.as_deref(), Some("216188"));
+            assert_eq!(info.repository_id.as_deref(), Some(HK_ID));
+            assert_eq!(info.repository_owner_id.as_deref(), Some(JDX_ID));
+            assert!(info.repository_accepted_owner_ids.is_empty());
             assert_eq!(
                 lock_pin("github.com/jdx/hk", &info),
                 Some(hk_pin("github.com/jdx/hk"))
@@ -342,10 +453,10 @@ mod tests {
         for expect in [
             expect(
                 "github.com/jdx/hook",
-                vec![hk_pin("github.com/jdx/hook")],
+                vec![local(hk_pin("github.com/jdx/hook"))],
                 None,
             ),
-            expect("github.com/jdx/hook", vec![], Some("922514152")),
+            expect("github.com/jdx/hook", vec![], Some(HK_ID)),
         ] {
             let ok = verify(&expect).unwrap();
             assert_eq!(
@@ -378,30 +489,60 @@ mod tests {
 
     #[test]
     fn a_recreated_name_is_refused() {
-        let other = ForgePin::new("github.com/jdx/hk", "1", Some("216188".into()));
-        let err = verify(&expect("github.com/jdx/hk", vec![other.clone()], None)).unwrap_err();
+        let other = ForgePin::new("github.com/jdx/hk", "1", Some(JDX_ID.into()));
+        let err = check(
+            &expect("github.com/jdx/hk", vec![local(other.clone())], None),
+            &hk(),
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("belongs to a different repository"), "{msg}");
         assert!(msg.contains("GitHub repository ID 922514152"), "{msg}");
         assert!(
-            msg.contains("mise packslip forget github.com/jdx/hk"),
+            msg.contains("mise pinned GitHub repository ID 1 for it"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("run `mise packslip forget github.com/jdx/hk` and install again"),
             "{msg}"
         );
 
-        // Every pin must hold: a lockfile's is checked after this machine's.
-        let err = verify(&expect(
-            "github.com/jdx/hk",
-            vec![hk_pin("github.com/jdx/hk"), other],
-            None,
-        ))
+        // Every pin must hold, and the refusal says which one did not.
+        let err = check(
+            &expect(
+                "github.com/jdx/hk",
+                vec![local(hk_pin("github.com/jdx/hk")), locked(other.clone())],
+                None,
+            ),
+            &hk(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("belongs to a different repository"), "{msg}");
+        assert!(
+            msg.contains("mise.lock pins GitHub repository ID 1 for it"),
+            "{msg}"
+        );
+        assert!(!msg.contains("mise packslip forget"), "{msg}");
+
+        // Both commit to it: forgetting the pin alone would not do.
+        let err = check(
+            &expect(
+                "github.com/jdx/hk",
+                vec![local(other.clone()), locked(other)],
+                None,
+            ),
+            &hk(),
+        )
         .unwrap_err();
         assert!(
-            err.to_string()
-                .contains("belongs to a different repository"),
+            err.to_string().contains(
+                "run `mise packslip forget github.com/jdx/hk`, remove the tool's entries from mise.lock, and install again"
+            ),
             "{err}"
         );
 
-        let err = verify(&expect("github.com/jdx/hook", vec![], Some("555"))).unwrap_err();
+        let err = check(&expect("github.com/jdx/hook", vec![], Some("555")), &hk()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("comes from a different repository than the one the name belongs to"),
@@ -414,19 +555,148 @@ mod tests {
         // Were jdx/hk transferred to acme/hk, a config still naming acme's
         // repository by its new name would see a release from before the
         // transfer as signed by jdx.
-        let err = verify(&expect("github.com/acme/hk", vec![], Some("922514152"))).unwrap_err();
+        let err = check(&expect("github.com/acme/hk", vec![], Some(HK_ID)), &hk()).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("the same repository under another owner"),
             "{msg}"
         );
         assert!(
+            msg.contains("owner jdx (ID 216188) signed it, but github.com/acme/hk has owner acme"),
+            "{msg}"
+        );
+        assert!(
             msg.contains("change the tool to packslip:github.com/jdx/hk"),
             "{msg}"
         );
-        let moved = ForgePin::new("github.com/acme/hk", "922514152", Some("999".into()));
-        let err = verify(&expect("github.com/acme/hk", vec![moved], None)).unwrap_err();
+        let moved = ForgePin::new("github.com/acme/hk", HK_ID, Some("999".into()));
+        let err = check(
+            &expect("github.com/acme/hk", vec![locked(moved.clone())], None),
+            &hk(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("but mise.lock pins owner acme (ID 999)"),
+            "{err}"
+        );
+        let err = check(
+            &expect("github.com/acme/hk", vec![local(moved)], None),
+            &hk(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("but mise pinned owner acme (ID 999)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_owner_the_pin_accepted_is_not_a_transfer() {
+        // A lock entry that accepted acme as well, as a pin does after an
+        // accepted transfer, takes a release acme signed and keeps it.
+        let pin = hk_pin("github.com/jdx/hk").with_accepted_owner_ids(["999"]);
+        let acme = source("acme/hk", HK_ID, "999");
+        let ok = check(&expect("github.com/jdx/hk", vec![locked(pin)], None), &acme).unwrap();
+        assert!(matches!(ok.continuity, Continuity::Renamed { .. }));
+        let mut info = PlatformInfo {
+            signer: Some(HK_SIGNER.into()),
+            ..Default::default()
+        };
+        lock_record(&mut info, Some(&ok));
+        assert_eq!(info.repository_owner_id.as_deref(), Some("999"));
+        assert_eq!(info.repository_accepted_owner_ids, vec![JDX_ID.to_string()]);
+        let pin = lock_pin("github.com/jdx/hk", &info).unwrap();
+        assert!(pin.accepts_owner(JDX_ID) && pin.accepts_owner("999"));
+    }
+
+    #[test]
+    fn an_owner_rename_is_told_apart_from_a_transfer() {
+        // jdx was called jdx2 when this release was signed. The forge says
+        // github.com/jdx/hk is repository 922514152 under owner 216188, the
+        // owner that signed, so this is the same owner under a new name.
+        let before_rename = source("jdx2/hk", HK_ID, JDX_ID);
+        let mut owner_known = expect("github.com/jdx/hk", vec![], Some(HK_ID));
+        owner_known.resolved_owner = Some(JDX_ID.into());
+        let ok = check(&owner_known, &before_rename).unwrap();
+        assert!(matches!(ok.continuity, Continuity::Renamed { .. }));
+        // Without the owner's ID, another owner name is a transfer.
+        let err = check(
+            &expect("github.com/jdx/hk", vec![], Some(HK_ID)),
+            &before_rename,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("under another owner"), "{err}");
+        // And another owner ID is one even under the requested owner's name.
+        let retaken = source("jdx/hk", HK_ID, "31337");
+        let err = check(&owner_known, &retaken).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "owner jdx (ID 31337) signed it, but github.com/jdx/hk has owner jdx (ID 216188)"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn only_an_answer_under_the_requested_owner_gives_its_id() {
+        assert!(under_owner("jdx", "jdx/hk"));
+        assert!(under_owner("JDX", "jdx/hook"));
+        assert!(!under_owner("jdx", "acme/hk"));
+        assert!(under_owner("group/sub", "group/sub/tool"));
+        assert!(!under_owner("group", "group/sub/tool"));
+        assert!(!under_owner("jdx", "hk"));
+    }
+
+    #[test]
+    fn lock_entries_continue_by_their_forge_ids() {
+        let entry = |repo: &str, id: Option<&str>| PlatformInfo {
+            signer: Some(format!(
+                "sigstore-oidc:https://gitlab.com/{repo}//.gitlab-ci.yml"
+            )),
+            repository_id: id.map(str::to_string),
+            repository_owner_id: id.map(|_| "7".to_string()),
+            ..Default::default()
+        };
+        let project = "gitlab.com/g/tool";
+        let old = entry("g/tool", Some("42"));
+        assert!(lock_entry_continues(project, &old, &old));
+        assert!(lock_entry_continues(
+            project,
+            &old,
+            &entry("g/tool2", Some("42"))
+        ));
+        assert!(!lock_entry_continues(
+            project,
+            &old,
+            &entry("g/tool", Some("43"))
+        ));
+        // Without IDs on both sides, the signer itself must be the same.
+        let legacy = entry("g/tool", None);
+        assert!(lock_entry_continues(project, &legacy, &old));
+        assert!(!lock_entry_continues(
+            project,
+            &legacy,
+            &entry("g/tool2", Some("42"))
+        ));
+        // Another scheme is another signer, whatever the identity.
+        let key = PlatformInfo {
+            signer: Some("sigstore-key:https://gitlab.com/g/tool//.gitlab-ci.yml".into()),
+            ..old.clone()
+        };
+        assert!(!lock_entry_continues(project, &old, &key));
+        // An entry that committed to no signer takes any.
+        assert!(lock_entry_continues(
+            project,
+            &PlatformInfo::default(),
+            &old
+        ));
+        assert!(!lock_entry_continues(
+            project,
+            &old,
+            &PlatformInfo::default()
+        ));
     }
 
     #[test]
@@ -437,7 +707,7 @@ mod tests {
         };
         assert_eq!(lock_pin("github.com/jdx/hk", &info), None);
         let unsigned = PlatformInfo {
-            repository_id: Some("922514152".into()),
+            repository_id: Some(HK_ID.into()),
             ..Default::default()
         };
         assert_eq!(lock_pin("github.com/jdx/hk", &unsigned), None);
@@ -445,26 +715,30 @@ mod tests {
             signer: Some(HK_SIGNER.into()),
             repository_id: Some("1".into()),
             repository_owner_id: Some("2".into()),
+            repository_accepted_owner_ids: vec!["3".into()],
             ..Default::default()
         };
         lock_record(&mut cleared, None);
         assert_eq!(cleared.repository_id, None);
         assert_eq!(cleared.repository_owner_id, None);
+        assert!(cleared.repository_accepted_owner_ids.is_empty());
     }
 
     #[test]
     fn a_machine_pin_follows_the_rename_and_records_the_forge_ids() {
+        fn observed(check: Option<&Check>) -> packslip_pins::Observed<'_> {
+            packslip_pins::Observed {
+                scheme: "sigstore-oidc",
+                key_id: "https://github.com/jdx/hk/.github/workflows/release.yml@refs/tags/v2.3.0",
+                issuer: Some(GITHUB_ISSUER),
+                attested_by: "vendor",
+                provenance: false,
+                logged: true,
+                forge: check,
+            }
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pins.toml");
-        let observed = |check: Option<&'static Check>| packslip_pins::Observed {
-            scheme: "sigstore-oidc",
-            key_id: "https://github.com/jdx/hk/.github/workflows/release.yml@refs/tags/v2.3.0",
-            issuer: Some("https://token.actions.githubusercontent.com"),
-            attested_by: "vendor",
-            provenance: false,
-            logged: true,
-            forge: check,
-        };
         // A pin set under the new name, before mise recorded forge IDs.
         let hook = "https://github.com/jdx/hook/.github/workflows/release.yml@refs/tags/v3.0.0";
         packslip_pins::record_at(
@@ -481,14 +755,10 @@ mod tests {
             packslip_pins::check_at(&path, "github.com/jdx/hook", observed(None)).unwrap_err();
         assert!(err.to_string().contains("mise packslip forget"), "{err}");
         // ...and the same workflow of the same repository by its ID.
-        let check: &'static Check = Box::leak(Box::new(
-            verify(&expect("github.com/jdx/hook", vec![], Some("922514152")))
-                .unwrap()
-                .check,
-        ));
-        packslip_pins::check_at(&path, "github.com/jdx/hook", observed(Some(check))).unwrap();
+        let check = check(&expect("github.com/jdx/hook", vec![], Some(HK_ID)), &hk()).unwrap();
+        packslip_pins::check_at(&path, "github.com/jdx/hook", observed(Some(&check))).unwrap();
         let pin =
-            packslip_pins::record_at(&path, "github.com/jdx/hook", observed(Some(check))).unwrap();
+            packslip_pins::record_at(&path, "github.com/jdx/hook", observed(Some(&check))).unwrap();
         assert_eq!(pin.forge, Some(hk_pin("github.com/jdx/hk")));
         assert_eq!(
             pin.signer,

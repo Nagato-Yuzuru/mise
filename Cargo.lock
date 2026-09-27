@@ -7482,8 +7482,7 @@ dependencies = [
 [[package]]
 name = "packslip"
 version = "1.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f3ddf5df713327cefb231b87c6e82e0d6c18cfbf6e1c489136440c9613b52ec"
+source = "git+https://github.com/jdx/packslip?rev=37a9d8d5876bb96c58960893681eef419bd25c6c#37a9d8d5876bb96c58960893681eef419bd25c6c"
 dependencies = [
  "base64 0.23.1",
  "blake2 0.11.0",

@@ -749,29 +749,6 @@ pub async fn populate_uv_locks(
     Ok(())
 }
 
-/// Whether a newly resolved Packslip entry is signed by the signer the old
-/// one committed to. That is the same signer string, or, when both entries
-/// record the same forge repository and owner IDs, the same workflow of that
-/// repository under the name it has now. A repository ID that changed is a
-/// different repository, even under the same name.
-fn packslip_signer_continues(old: &PlatformInfo, new: &PlatformInfo) -> bool {
-    let (Some(old_signer), Some(new_signer)) = (&old.signer, &new.signer) else {
-        return old.signer.is_none();
-    };
-    if let (Some(before), Some(now)) = (&old.repository_id, &new.repository_id)
-        && before != now
-    {
-        return false;
-    }
-    if old_signer == new_signer {
-        return true;
-    }
-    let same_repository = old.repository_id.is_some() && old.repository_id == new.repository_id;
-    let same_owner =
-        old.repository_owner_id.is_some() && old.repository_owner_id == new.repository_owner_id;
-    same_repository && same_owner && crate::packslip_pins::same_workflow(old_signer, new_signer)
-}
-
 fn ensure_no_downgrade(old: &PlatformInfo, new: &PlatformInfo, backend: &str) -> Result<()> {
     // A verified Packslip signer is the replacement trust baseline for an
     // artifact authenticated by its signed release manifest. Older incremental
@@ -789,8 +766,15 @@ fn ensure_no_downgrade(old: &PlatformInfo, new: &PlatformInfo, backend: &str) ->
             "lockfile generation would downgrade recorded provenance; previous files were preserved"
         );
     }
+    // A Packslip entry's signer continues as the same string, or, when both
+    // entries record the same forge repository, as the same workflow of it
+    // under the name it has now.
     if old.signer.is_some()
-        && (!packslip_signer_continues(old, new) || new.attested_by != old.attested_by)
+        && (!crate::packslip_forge::lock_entry_continues(
+            backend.strip_prefix("packslip:").unwrap_or(backend),
+            old,
+            new,
+        ) || new.attested_by != old.attested_by)
     {
         bail!(
             "lockfile generation would change the recorded signer; previous files were preserved"
@@ -1515,6 +1499,12 @@ mod tests {
             ..old.clone()
         };
         assert!(ensure_no_downgrade(&old, &transferred, backend).is_err());
+        // Unless the new entry's pin accepts the owner it moved from.
+        let accepted = PlatformInfo {
+            repository_accepted_owner_ids: vec!["7".into()],
+            ..transferred
+        };
+        assert!(ensure_no_downgrade(&old, &accepted, backend).is_ok());
         // Another workflow of the same repository is another signer.
         let other_workflow = PlatformInfo {
             signer: Some(

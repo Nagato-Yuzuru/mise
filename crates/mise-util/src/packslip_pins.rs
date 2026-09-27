@@ -128,27 +128,6 @@ pub fn signer_of(scheme: &str, key_id: &str) -> String {
     key_id.to_string()
 }
 
-/// Whether two signers, as a pin or a lockfile records them (`scheme:` and
-/// all, or without it), are the same workflow inside their repository. Only
-/// meaningful once the forge's repository ID has shown the repository is the
-/// same one, whatever it was called when each was recorded.
-pub fn same_workflow(a: &str, b: &str) -> bool {
-    fn path(signer: &str) -> Option<(&str, &str)> {
-        let signer = signer.strip_prefix("sigstore-oidc:").unwrap_or(signer);
-        let rest = signer.strip_prefix("https://")?;
-        let rest = rest.rsplit_once('@').map_or(rest, |(path, _)| path);
-        if let Some(path) = rest.strip_prefix("github.com/") {
-            let mut parts = path.splitn(3, '/');
-            let (_owner, _repo, file) = (parts.next()?, parts.next()?, parts.next()?);
-            return Some(("github.com", file));
-        }
-        let path = rest.strip_prefix("gitlab.com/")?;
-        let (_project, file) = path.split_once("//")?;
-        Some(("gitlab.com", file))
-    }
-    matches!((path(a), path(b)), (Some(a), Some(b)) if a == b)
-}
-
 /// The pin for `project`: its own, or one recorded under an older name for
 /// a repository that was accepted as `project` after a rename, so that
 /// following the rename in a config keeps what was pinned.
@@ -553,14 +532,19 @@ pinned_at = "2026-09-01T00:00:00Z"
                 provenance: false,
                 unlogged: false,
                 pinned_at: "2026-09-01T00:00:00Z".into(),
-                forge: Some(ForgePin::new("github.com/new/r", "42", Some("7".into()))),
+                forge: Some(
+                    ForgePin::new("github.com/new/r", "42", Some("7".into()))
+                        .with_accepted_owner_ids(["6"]),
+                ),
             },
         );
         save(&path, &pins).unwrap();
         let text = file::read_to_string(&path).unwrap();
         assert!(text.contains("[pins.\"github.com/old/r\".forge]"), "{text}");
         assert!(text.contains("repository_id = \"42\""), "{text}");
-        let pin = ForgePin::new("github.com/new/r", "42", Some("7".into()));
+        assert!(text.contains("accepted_owner_ids = [\"6\"]"), "{text}");
+        let pin = ForgePin::new("github.com/new/r", "42", Some("7".into()))
+            .with_accepted_owner_ids(["6"]);
         assert_eq!(
             forge_pin_at(&path, "github.com/old/r").unwrap().as_ref(),
             Some(&pin)
@@ -574,30 +558,5 @@ pinned_at = "2026-09-01T00:00:00Z"
         // Forgetting the new name forgets the pin found under it.
         assert!(forget_at(&path, "github.com/new/r").unwrap());
         assert_eq!(forge_pin_at(&path, "github.com/old/r").unwrap(), None);
-    }
-
-    #[test]
-    fn workflows_are_compared_within_their_repository() {
-        let release =
-            |repo: &str| format!("https://github.com/{repo}/.github/workflows/release.yml");
-        assert!(same_workflow(&release("old/r"), &release("new/r")));
-        assert!(same_workflow(
-            &format!("sigstore-oidc:{}", release("old/r")),
-            &format!("{}@refs/tags/v2", release("new/r"))
-        ));
-        assert!(!same_workflow(
-            &release("o/r"),
-            "https://github.com/o/r/.github/workflows/other.yml"
-        ));
-        assert!(same_workflow(
-            "https://gitlab.com/g/old//.gitlab-ci.yml",
-            "https://gitlab.com/g/sub/new//.gitlab-ci.yml@refs/tags/v1"
-        ));
-        assert!(!same_workflow(
-            "https://gitlab.com/g/r//.github/workflows/release.yml",
-            &release("g/r")
-        ));
-        assert!(!same_workflow("sigstore-key:5A0A", "sigstore-key:5A0A"));
-        assert!(!same_workflow("alice@example.com", "alice@example.com"));
     }
 }

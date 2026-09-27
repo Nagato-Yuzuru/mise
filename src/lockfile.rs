@@ -575,6 +575,12 @@ pub struct PlatformInfo {
     /// which a transfer to another owner changes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repository_owner_id: Option<String>,
+    /// Other owner IDs the repository is accepted under besides
+    /// `repository_owner_id`, such as the owner a transfer someone accepted
+    /// moved it from, so that releases signed before the transfer still
+    /// verify. Usually empty, and then omitted.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub repository_accepted_owner_ids: Vec<String>,
     /// Ordered release artifacts extracted into the primary artifact's install directory.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub additional_artifacts: Vec<ArtifactInfo>,
@@ -607,6 +613,7 @@ impl PlatformInfo {
             && self.attested_by.is_none()
             && self.repository_id.is_none()
             && self.repository_owner_id.is_none()
+            && self.repository_accepted_owner_ids.is_empty()
             && self.additional_artifacts.is_empty()
     }
 
@@ -630,6 +637,7 @@ impl PlatformInfo {
             attested_by: self.attested_by.clone(),
             repository_id: self.repository_id.clone(),
             repository_owner_id: self.repository_owner_id.clone(),
+            repository_accepted_owner_ids: self.repository_accepted_owner_ids.clone(),
             additional_artifacts: Default::default(),
         }
     }
@@ -734,6 +742,11 @@ impl PlatformInfo {
                 self.repository_owner_id.clone()
             } else {
                 other.repository_owner_id.clone()
+            },
+            repository_accepted_owner_ids: if self.signer.is_some() {
+                self.repository_accepted_owner_ids.clone()
+            } else {
+                other.repository_accepted_owner_ids.clone()
             },
             additional_artifacts: if artifact_changed {
                 self.additional_artifacts.clone()
@@ -858,6 +871,20 @@ impl TryFrom<toml::Value> for PlatformInfo {
                     Some(toml::Value::String(s)) => Some(s),
                     _ => None,
                 };
+                let repository_accepted_owner_ids = match t.remove("repository_accepted_owner_ids")
+                {
+                    Some(toml::Value::Array(values)) => values
+                        .into_iter()
+                        .map(|value| match value {
+                            toml::Value::String(s) => Ok(s),
+                            _ => bail!("repository_accepted_owner_ids must be strings in lockfile"),
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                    Some(_) => {
+                        bail!("repository_accepted_owner_ids must be an array in lockfile")
+                    }
+                    None => Vec::new(),
+                };
                 let additional_artifacts = match t.remove("additional_artifacts") {
                     Some(toml::Value::Array(values)) => values
                         .into_iter()
@@ -880,6 +907,7 @@ impl TryFrom<toml::Value> for PlatformInfo {
                     attested_by,
                     repository_id,
                     repository_owner_id,
+                    repository_accepted_owner_ids,
                     additional_artifacts,
                 })
             }
@@ -955,6 +983,12 @@ impl From<PlatformInfo> for toml::Value {
         if let Some(id) = platform_info.repository_owner_id {
             table.insert("repository_owner_id".to_string(), id.into());
         }
+        if !platform_info.repository_accepted_owner_ids.is_empty() {
+            table.insert(
+                "repository_accepted_owner_ids".to_string(),
+                platform_info.repository_accepted_owner_ids.into(),
+            );
+        }
         toml::Value::Table(table)
     }
 }
@@ -971,10 +1005,25 @@ mod signer_round_trip {
             attested_by: Some("repackager".into()),
             repository_id: Some("922514152".into()),
             repository_owner_id: Some("216188".into()),
+            repository_accepted_owner_ids: vec!["999".into()],
             ..Default::default()
         };
         let value: toml::Value = info.clone().into();
+        assert_eq!(
+            value.get("repository_accepted_owner_ids"),
+            Some(&toml::Value::from(vec!["999"]))
+        );
         assert_eq!(PlatformInfo::try_from(value).unwrap(), info);
+        let none: toml::Value = PlatformInfo {
+            repository_accepted_owner_ids: vec![],
+            ..info.clone()
+        }
+        .into();
+        assert_eq!(
+            none.get("repository_accepted_owner_ids"),
+            None,
+            "no accepted owners, no field"
+        );
         assert_eq!(
             info.without_artifact_data().repository_id,
             info.repository_id,
@@ -989,6 +1038,7 @@ mod signer_round_trip {
         assert_eq!(legacy.signer, info.signer);
         assert_eq!(legacy.repository_id, None);
         assert_eq!(legacy.repository_owner_id, None);
+        assert!(legacy.repository_accepted_owner_ids.is_empty());
         assert!(!info.is_empty());
         assert_eq!(info.without_artifact_data().signer, info.signer);
         let bad = toml::Value::Table(toml::toml! { attested_by = "someone" });
@@ -1720,6 +1770,11 @@ impl Lockfile {
                         platform_info.repository_owner_id
                     } else {
                         existing.repository_owner_id.clone()
+                    },
+                    repository_accepted_owner_ids: if platform_info.signer.is_some() {
+                        platform_info.repository_accepted_owner_ids
+                    } else {
+                        existing.repository_accepted_owner_ids.clone()
                     },
                     signer: platform_info.signer.or_else(|| existing.signer.clone()),
                     additional_artifacts: if preserve_artifact_fields {

@@ -182,8 +182,12 @@ new one.
 With no pin for the project yet, and a release signed under another name, mise
 asks the forge what the requested name resolves to. GitHub's
 `GET /repos/{owner}/{repo}` answers a renamed repository's old name with its new
-name and unchanged ID. If the forge cannot be asked, for example offline or when
-rate-limited, mise compares names only, as before, and refuses the release.
+name and unchanged ID. When that answer is under the requested owner, mise also
+takes the owner's ID from it, so a release signed before the owner account
+itself was renamed installs, while one signed by another account that took the
+owner's name is refused as a transfer. If the forge cannot be asked, for example
+offline or when rate-limited, mise compares names only, as before, and refuses
+the release.
 
 This is still trust on first use. The first install on a machine with no pin and
 no lockfile entry accepts whichever repository the name belongs to at that
