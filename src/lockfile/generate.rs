@@ -1499,6 +1499,13 @@ mod tests {
             ..old.clone()
         };
         assert!(ensure_no_downgrade(&old, &transferred, backend).is_err());
+        // Even under the same name and signer: the owner commitment does not
+        // change without a transfer someone accepted.
+        let retaken = PlatformInfo {
+            repository_owner_id: Some("8".into()),
+            ..old.clone()
+        };
+        assert!(ensure_no_downgrade(&old, &retaken, backend).is_err());
         // Unless the new entry's pin accepts the owner it moved from.
         let accepted = PlatformInfo {
             repository_accepted_owner_ids: vec!["7".into()],
